@@ -1,7 +1,18 @@
-import {
-  HandLandmarker,
-  FilesetResolver
-} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
+// app.js
+// Overwrite your entire app.js with this.
+//
+// Changes vs your previous version:
+// 1) Much smoother + “persistent” cursor:
+//    - OneEuro filters for cursor X/Y (kept)
+//    - Extra smoothing for handScalePx (reduces size jitter)
+//    - Grace period when the hand is briefly lost (keeps last cursor + avoids resets)
+//    - Hover stabilization (small dwell) to stop hover flicker
+//
+// 2) Close viewer no longer uses pinch-on-(X).
+//    - Close uses a THUMBS-UP gesture (debounced).
+//    - Pinch remains ONLY for opening a thumbnail in grid mode.
+
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
 
 // =====================
 // DOM
@@ -18,12 +29,12 @@ const cursorEl = document.getElementById("cursor");
 
 const viewerEl = document.getElementById("viewer");
 const viewerImg = document.getElementById("viewerImg");
-const closeBtn = document.getElementById("closeBtn");
+const closeBtn = document.getElementById("closeBtn"); // now “visual only”, mouse click still works
 
 const overlayCtx = overlay.getContext("2d");
 
 // =====================
-// Demo "files" (online URLs)
+// Demo files
 // =====================
 const FILES = [
   { id: "1", name: "Mountains", url: "https://images.unsplash.com/photo-1501785888041-af3ef285b470?auto=format&fit=crop&w=1600&q=80" },
@@ -63,10 +74,17 @@ function setStatus(msg) {
 }
 
 // =====================
-// One Euro filter
+// Utils
+// =====================
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function easeOutCubic(t) { return 1 - Math.pow(1 - t, 3); }
+
+// =====================
+// One Euro filter (cursor smoothing)
 // =====================
 class OneEuroFilter {
-  constructor(freq = 60, minCutoff = 1.2, beta = 0.05, dCutoff = 1.0) {
+  constructor(freq = 60, minCutoff = 1.0, beta = 0.02, dCutoff = 1.0) {
     this.freq = freq;
     this.minCutoff = minCutoff;
     this.beta = beta;
@@ -114,11 +132,14 @@ class OneEuroFilter {
   }
 }
 
-const xFilter = new OneEuroFilter(60, 1.2, 0.05, 1.0);
-const yFilter = new OneEuroFilter(60, 1.2, 0.05, 1.0);
+const xFilter = new OneEuroFilter(60, 1.0, 0.02, 1.0);
+const yFilter = new OneEuroFilter(60, 1.0, 0.02, 1.0);
+
+// Extra smoothing for scale (reduces pointer size jitter)
+const scaleFilter = new OneEuroFilter(60, 0.9, 0.01, 1.0);
 
 // =====================
-// Pinch debounce + hysteresis
+// Pinch debounce + hysteresis (OPEN only)
 // =====================
 let pinchClosed = false;
 let pinchOnCount = 0;
@@ -126,8 +147,18 @@ let pinchOffCount = 0;
 
 const PINCH_ON = 0.30;
 const PINCH_OFF = 0.60;
-const ON_FRAMES = 2;
-const OFF_FRAMES = 3;
+const PINCH_ON_FRAMES = 2;
+const PINCH_OFF_FRAMES = 3;
+
+// =====================
+// Thumbs-up debounce (CLOSE)
+// =====================
+let thumbsUpOnCount = 0;
+let thumbsUpOffCount = 0;
+let thumbsUpActive = false;
+
+const THUMBS_ON_FRAMES = 4;   // require more frames for reliability
+const THUMBS_OFF_FRAMES = 4;
 
 // =====================
 // State
@@ -136,20 +167,23 @@ let handLandmarker = null;
 let running = false;
 let lastVideoTime = -1;
 
-let wasPinching = false;
-let isPinching = false;
-
-let hoveredEl = null;
-let selectedEl = null;
-
 let mode = "grid"; // "grid" | "viewer"
 
-// =====================
-// Geometry + helpers
-// =====================
-function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
-function lerp(a, b, t) { return a + (b - a) * t; }
+// Cursor persistence / hand-loss handling
+let lastSeenMs = 0;
+const HAND_LOST_GRACE_MS = 350; // brief occlusions won’t reset everything
 
+// Hover stabilization
+let hoveredEl = null;
+let hoverCandidate = null;
+let hoverCandidateSince = 0;
+const HOVER_DWELL_MS = 70; // prevents hover flicker
+
+let selectedEl = null;
+
+// =====================
+// Geometry helpers
+// =====================
 function resizeOverlay() {
   const rect = stage.getBoundingClientRect();
   overlay.width = Math.round(rect.width);
@@ -170,15 +204,14 @@ function getHandScaleNorm(landmarks) {
   return d > 0 ? d : 0.0001;
 }
 
-// Convert normalized "hand scale" to pixels using stage size
-function getHandScalePx(landmarks) {
+function getHandScalePxRaw(landmarks) {
   const hsNorm = getHandScaleNorm(landmarks);
   const rect = stage.getBoundingClientRect();
   const minDim = Math.min(rect.width, rect.height);
   return hsNorm * minDim;
 }
 
-// Mirror X so left/right feels natural
+// Mirror X so movement feels natural
 function screenCoordsFromLandmark(landmark) {
   const rect = stage.getBoundingClientRect();
   const mirroredX = 1 - landmark.x;
@@ -191,6 +224,7 @@ function elementUnderPoint(clientX, clientY) {
   const el = document.elementFromPoint(clientX, clientY);
   if (!el) return null;
 
+  // viewer close button (visual only); keep hover highlight for UX
   if (el === closeBtn || closeBtn.contains(el)) return closeBtn;
 
   const thumb = el.closest?.(".thumb.file");
@@ -199,19 +233,28 @@ function elementUnderPoint(clientX, clientY) {
   return null;
 }
 
-function setHovered(next) {
+function applyHovered(next) {
   if (hoveredEl === next) return;
 
   if (hoveredEl) {
     if (hoveredEl.classList?.contains("thumb")) hoveredEl.classList.remove("hovered");
     if (hoveredEl === closeBtn) closeBtn.classList.remove("hovered");
   }
-
   hoveredEl = next;
-
   if (hoveredEl) {
     if (hoveredEl.classList?.contains("thumb")) hoveredEl.classList.add("hovered");
     if (hoveredEl === closeBtn) closeBtn.classList.add("hovered");
+  }
+}
+
+function stabilizeHover(next, nowMs) {
+  if (next !== hoverCandidate) {
+    hoverCandidate = next;
+    hoverCandidateSince = nowMs;
+    return;
+  }
+  if (hoveredEl !== hoverCandidate && (nowMs - hoverCandidateSince) >= HOVER_DWELL_MS) {
+    applyHovered(hoverCandidate);
   }
 }
 
@@ -235,41 +278,27 @@ function closeViewer() {
   log("CLOSE viewer");
 }
 
-function updatePinchStateDebounced(landmarks) {
-  const thumbTip = landmarks[4];
-  const indexTip = landmarks[8];
+// =====================
+// Pointer scaling
+// =====================
+function handScaleToT(hsPx) {
+  // Calibrated from your logs:
+  // far ~ 38–46px, near ~ 190–230px, very near ~ 290px
+  const FAR_PX = 40;
+  const NEAR_PX = 300;
+  const lin = clamp((hsPx - FAR_PX) / (NEAR_PX - FAR_PX), 0, 1);
+  return easeOutCubic(lin);
+}
 
-  const rawDist = distance(thumbTip, indexTip);
-  const handScale = getHandScaleNorm(landmarks);
-  const normDist = rawDist / handScale;
-
-  if (!pinchClosed) {
-    if (normDist < PINCH_ON) pinchOnCount++;
-    else pinchOnCount = 0;
-
-    if (pinchOnCount >= ON_FRAMES) {
-      pinchClosed = true;
-      pinchOnCount = 0;
-      pinchOffCount = 0;
-      log(`Pinch ON (normDist=${normDist.toFixed(2)})`);
-    }
-  } else {
-    if (normDist > PINCH_OFF) pinchOffCount++;
-    else pinchOffCount = 0;
-
-    if (pinchOffCount >= OFF_FRAMES) {
-      pinchClosed = false;
-      pinchOffCount = 0;
-      pinchOnCount = 0;
-      log(`Pinch OFF (normDist=${normDist.toFixed(2)})`);
-    }
-  }
-
-  return pinchClosed;
+function updateCursorSizeFromT(t) {
+  // Cursor diameter range (px)
+  const d = lerp(14, 34, t);
+  cursorEl.style.width = `${d}px`;
+  cursorEl.style.height = `${d}px`;
 }
 
 // =====================
-// Overlay drawing (distance-scaled pointers)
+// Overlay drawing
 // =====================
 function clearOverlay() {
   overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
@@ -285,39 +314,128 @@ function drawPoint(x, y, r, fill, stroke) {
   overlayCtx.stroke();
 }
 
-/**
- * Maps hand pixel scale -> t in [0..1] => pointer radius.
- * Tune FAR_PX and NEAR_PX for your camera + typical framing.
- */
-function handScaleToT(hsPx) {
-  const FAR_PX = 60;   // far hand ~ smaller
-  const NEAR_PX = 180; // close hand ~ bigger
-  return clamp((hsPx - FAR_PX) / (NEAR_PX - FAR_PX), 0, 1);
-}
-
-function drawThumbIndexPointsScaled(landmarks) {
+function drawThumbIndexPointsScaled(landmarks, t) {
   clearOverlay();
-
   const thumb = screenCoordsFromLandmark(landmarks[4]);
   const index = screenCoordsFromLandmark(landmarks[8]);
 
-  const hsPx = getHandScalePx(landmarks);
-  const t = handScaleToT(hsPx);
-
-  const thumbR = lerp(5, 12, t);
-  const indexR = lerp(7, 16, t);
+  const thumbR = lerp(5, 16, t);
+  const indexR = lerp(7, 22, t);
 
   drawPoint(thumb.x, thumb.y, thumbR, "rgba(255,255,255,0.30)", "rgba(255,255,255,0.85)");
   drawPoint(index.x, index.y, indexR, "rgba(120,180,255,0.35)", "rgba(120,180,255,0.95)");
-
-  return { t, hsPx };
 }
 
-function updateCursorSizeFromT(t) {
-  // Cursor diameter range 14..28 px
-  const d = lerp(14, 28, t);
-  cursorEl.style.width = `${d}px`;
-  cursorEl.style.height = `${d}px`;
+// =====================
+// Gesture detectors
+// =====================
+function updatePinchStateDebounced(landmarks) {
+  const thumbTip = landmarks[4];
+  const indexTip = landmarks[8];
+
+  const rawDist = distance(thumbTip, indexTip);
+  const handScale = getHandScaleNorm(landmarks);
+  const normDist = rawDist / handScale;
+
+  if (!pinchClosed) {
+    if (normDist < PINCH_ON) pinchOnCount++;
+    else pinchOnCount = 0;
+
+    if (pinchOnCount >= PINCH_ON_FRAMES) {
+      pinchClosed = true;
+      pinchOnCount = 0;
+      pinchOffCount = 0;
+      log(`Pinch ON (normDist=${normDist.toFixed(2)})`);
+    }
+  } else {
+    if (normDist > PINCH_OFF) pinchOffCount++;
+    else pinchOffCount = 0;
+
+    if (pinchOffCount >= PINCH_OFF_FRAMES) {
+      pinchClosed = false;
+      pinchOffCount = 0;
+      pinchOnCount = 0;
+      log(`Pinch OFF (normDist=${normDist.toFixed(2)})`);
+    }
+  }
+  return pinchClosed;
+}
+
+/**
+ * Thumbs-up heuristic (works well in typical webcam framing):
+ * - Thumb tip is ABOVE thumb IP and thumb MCP (y smaller = higher)
+ * - Thumb tip is above wrist
+ * - Other fingertips are NOT above their PIP joints (i.e. folded/neutral), and are close-ish to palm.
+ *
+ * This is a heuristic, not a classifier; we debounce it for stability.
+ */
+function isThumbsUpRaw(landmarks) {
+  const wrist = landmarks[0];
+
+  const thumbTip = landmarks[4];
+  const thumbIp  = landmarks[3];
+  const thumbMcp = landmarks[2];
+
+  const indexTip = landmarks[8],  indexPip = landmarks[6],  indexMcp = landmarks[5];
+  const midTip   = landmarks[12], midPip   = landmarks[10], midMcp   = landmarks[9];
+  const ringTip  = landmarks[16], ringPip  = landmarks[14], ringMcp  = landmarks[13];
+  const pinkTip  = landmarks[20], pinkPip  = landmarks[18], pinkMcp  = landmarks[17];
+
+  // Thumb must be clearly "up"
+  const thumbUp =
+    (thumbTip.y < thumbIp.y) &&
+    (thumbIp.y  < thumbMcp.y) &&
+    (thumbTip.y < wrist.y);
+
+  if (!thumbUp) return false;
+
+  // Other fingers should be folded/neutral (not extended upward).
+  // Two tests:
+  // 1) tip is below pip (y greater) => folded/downward
+  // 2) tip is close to mcp relative to hand scale => curled
+  const hs = getHandScaleNorm(landmarks);
+
+  function folded(tip, pip, mcp) {
+    const tipBelowPip = tip.y > pip.y;
+    const curled = (distance(tip, mcp) / hs) < 1.10; // tune if needed
+    return tipBelowPip || curled;
+  }
+
+  const othersFolded =
+    folded(indexTip, indexPip, indexMcp) &&
+    folded(midTip,   midPip,   midMcp) &&
+    folded(ringTip,  ringPip,  ringMcp) &&
+    folded(pinkTip,  pinkPip,  pinkMcp);
+
+  return othersFolded;
+}
+
+function updateThumbsUpDebounced(landmarks) {
+  const raw = isThumbsUpRaw(landmarks);
+
+  if (!thumbsUpActive) {
+    if (raw) thumbsUpOnCount++;
+    else thumbsUpOnCount = 0;
+
+    if (thumbsUpOnCount >= THUMBS_ON_FRAMES) {
+      thumbsUpActive = true;
+      thumbsUpOnCount = 0;
+      thumbsUpOffCount = 0;
+      log("ThumbsUp ON");
+    }
+  } else {
+    if (!raw) thumbsUpOffCount++;
+    else thumbsUpOffCount = 0;
+
+    if (thumbsUpOffCount >= THUMBS_OFF_FRAMES) {
+      thumbsUpActive = false;
+      thumbsUpOffCount = 0;
+      thumbsUpOnCount = 0;
+      log("ThumbsUp OFF");
+    }
+  }
+
+  return thumbsUpActive;
 }
 
 // =====================
@@ -325,15 +443,12 @@ function updateCursorSizeFromT(t) {
 // =====================
 async function initHandLandmarker() {
   setStatus("Loading MediaPipe hand model…");
-
   const vision = await FilesetResolver.forVisionTasks(
     "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
   );
 
   handLandmarker = await HandLandmarker.createFromOptions(vision, {
-    baseOptions: {
-      modelAssetPath: "https://storage.googleapis.com/mediapipe-assets/hand_landmarker.task"
-    },
+    baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-assets/hand_landmarker.task" },
     numHands: 1,
     runningMode: "VIDEO"
   });
@@ -356,7 +471,7 @@ async function startCamera() {
 
   running = true;
   cursorEl.classList.add("visible");
-  setStatus("Camera started. Use index as cursor; pinch to click.");
+  setStatus("Camera started. Index = cursor. Pinch opens. Thumbs-up closes.");
   log("Ready.");
 
   requestAnimationFrame(loop);
@@ -365,9 +480,31 @@ async function startCamera() {
 // =====================
 // Main loop
 // =====================
+let wasPinching = false;
 let lastScaleLogAt = 0;
 
-function loop() {
+// Keep last cursor position if hand briefly disappears
+let lastCursorX = 0;
+let lastCursorY = 0;
+let lastT = 0;
+
+function resetAllFiltersAndStates() {
+  pinchClosed = false;
+  pinchOnCount = 0;
+  pinchOffCount = 0;
+
+  thumbsUpActive = false;
+  thumbsUpOnCount = 0;
+  thumbsUpOffCount = 0;
+
+  xFilter.reset();
+  yFilter.reset();
+  scaleFilter.reset();
+
+  wasPinching = false;
+}
+
+function loop(nowMs) {
   if (!running || !handLandmarker) return;
 
   const videoTime = video.currentTime;
@@ -377,34 +514,36 @@ function loop() {
   }
   lastVideoTime = videoTime;
 
-  const nowMs = performance.now();
   const results = handLandmarker.detectForVideo(video, nowMs);
 
   if (results?.landmarks?.length) {
+    lastSeenMs = nowMs;
+
     const landmarks = results.landmarks[0];
 
-    // pinch state
-    isPinching = updatePinchStateDebounced(landmarks);
-
-    // cursor position from index fingertip
+    // Cursor position (index tip)
     let { x, y } = screenCoordsFromLandmark(landmarks[8]);
+
+    // Heavy smoothing for jitter reduction
     x = xFilter.filter(x, nowMs);
     y = yFilter.filter(y, nowMs);
+
+    lastCursorX = x;
+    lastCursorY = y;
 
     cursorEl.style.left = `${x}px`;
     cursorEl.style.top = `${y}px`;
 
-    // draw pointers, compute scaling t
-    const { t, hsPx } = drawThumbIndexPointsScaled(landmarks);
+    // Smooth scale too
+    const hsPxRaw = getHandScalePxRaw(landmarks);
+    const hsPx = scaleFilter.filter(hsPxRaw, nowMs);
+    const t = handScaleToT(hsPx);
+    lastT = t;
+
     updateCursorSizeFromT(t);
+    drawThumbIndexPointsScaled(landmarks, t);
 
-    // occasional scale logging to help calibrate FAR/NEAR
-    if (nowMs - lastScaleLogAt > 1000) {
-      lastScaleLogAt = nowMs;
-      log(`handScalePx=${hsPx.toFixed(1)} t=${t.toFixed(2)}`);
-    }
-
-    // hover detection uses client coords
+    // Hover
     const stageRect = stage.getBoundingClientRect();
     const clientX = stageRect.left + x;
     const clientY = stageRect.top + y;
@@ -412,14 +551,17 @@ function loop() {
     const under = elementUnderPoint(clientX, clientY);
 
     if (mode === "grid") {
-      setHovered(under && under.classList?.contains("thumb") ? under : null);
-      closeBtn.classList.remove("hovered");
+      stabilizeHover(under && under.classList?.contains("thumb") ? under : null, nowMs);
+      // don’t highlight close in grid mode
+      if (hoveredEl === closeBtn) applyHovered(null);
     } else {
-      setHovered(under === closeBtn ? closeBtn : null);
+      // viewer mode: hover close only (visual)
+      stabilizeHover(under === closeBtn ? closeBtn : null, nowMs);
     }
 
-    // pinch edge triggers action
-    if (isPinching && !wasPinching) {
+    // Pinch for OPEN only
+    const pinching = updatePinchStateDebounced(landmarks);
+    if (pinching && !wasPinching) {
       if (mode === "grid") {
         const target = hoveredEl && hoveredEl.classList?.contains("thumb") ? hoveredEl : null;
         if (target) {
@@ -430,32 +572,48 @@ function loop() {
         } else {
           log("Pinch down: nothing selected");
         }
-      } else {
-        if (hoveredEl === closeBtn) {
-          closeViewer();
-          clearSelected();
-          setHovered(null);
-        } else {
-          log("Pinch down in viewer: not on (X)");
-        }
       }
+      // viewer mode: pinch does nothing now
+    }
+    wasPinching = pinching;
+
+    // Thumbs-up to CLOSE (viewer only)
+    const thumbsUp = updateThumbsUpDebounced(landmarks);
+    if (mode === "viewer" && thumbsUp) {
+      // Close once per thumbs-up activation
+      // (thumbsUpActive stays true for a bit; close and then wait until OFF)
+      closeViewer();
+      clearSelected();
+      applyHovered(null);
+      // prevent immediate re-close loops; require OFF before re-trigger
+      thumbsUpActive = true;
+      thumbsUpOnCount = 0;
+      thumbsUpOffCount = 0;
     }
 
-    wasPinching = isPinching;
+    // periodic calibration logging
+    if (nowMs - lastScaleLogAt > 1200) {
+      lastScaleLogAt = nowMs;
+      log(`handScalePx(raw=${hsPxRaw.toFixed(1)} smooth=${hsPx.toFixed(1)}) t=${t.toFixed(2)}`);
+    }
   } else {
-    // hand lost
-    clearOverlay();
-    setHovered(null);
+    // No hand this frame.
+    // Keep cursor/pointers for a short grace period to feel “persistent”.
+    const since = nowMs - lastSeenMs;
 
-    wasPinching = false;
-    isPinching = false;
+    if (since <= HAND_LOST_GRACE_MS) {
+      cursorEl.style.left = `${lastCursorX}px`;
+      cursorEl.style.top = `${lastCursorY}px`;
+      updateCursorSizeFromT(lastT);
+      // keep overlay as-is
+    } else {
+      // true loss: clear overlay + hover, reset states
+      clearOverlay();
+      stabilizeHover(null, nowMs);
+      applyHovered(null);
 
-    pinchClosed = false;
-    pinchOnCount = 0;
-    pinchOffCount = 0;
-
-    xFilter.reset();
-    yFilter.reset();
+      resetAllFiltersAndStates();
+    }
   }
 
   requestAnimationFrame(loop);
@@ -475,7 +633,7 @@ startBtn.addEventListener("click", async () => {
   }
 });
 
-// mouse close for debugging
+// Mouse close for debugging (optional)
 closeBtn.addEventListener("click", () => closeViewer());
 
 if (!("mediaDevices" in navigator && "getUserMedia" in navigator.mediaDevices)) {
