@@ -1,0 +1,767 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Gesture File Manager (Pinch Open/Close)</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --panel: rgba(255,255,255,0.06);
+      --panel2: rgba(255,255,255,0.10);
+      --text: rgba(255,255,255,0.9);
+      --muted: rgba(255,255,255,0.65);
+      --accent: rgba(120,180,255,0.95);
+      --danger: rgba(255,120,120,0.95);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      background: radial-gradient(1200px 800px at 30% 10%, #18224a 0%, var(--bg) 60%);
+      color: var(--text);
+      overflow-x: hidden;
+    }
+
+    header {
+      padding: 14px 16px;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+      position: sticky;
+      top: 0;
+      background: rgba(8,12,24,0.78);
+      backdrop-filter: blur(10px);
+      z-index: 10;
+    }
+
+    #startBtn {
+      appearance: none;
+      border: 1px solid rgba(255,255,255,0.15);
+      background: rgba(255,255,255,0.06);
+      color: var(--text);
+      padding: 10px 12px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    #startBtn:hover { background: rgba(255,255,255,0.09); }
+
+    #status {
+      font-size: 14px;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    #wrap {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+      padding: 12px 16px 16px;
+    }
+
+    #stage {
+      position: relative;
+      width: min(1100px, 100%);
+      margin: 0 auto;
+      aspect-ratio: 16/9;
+      border: 1px solid rgba(255,255,255,0.10);
+      border-radius: 16px;
+      overflow: hidden;
+      background: rgba(255,255,255,0.04);
+    }
+
+    /* Hide the video; we still use it for inference. */
+    #webcam {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      opacity: 0.0;
+      pointer-events: none;
+      transform: scaleX(-1); /* mirror for a more natural feel if you ever show it */
+    }
+
+    /* Desktop layer */
+    #desktop {
+      position: absolute;
+      inset: 0;
+      padding: 18px;
+    }
+
+    .grid {
+      display: grid;
+      gap: 18px;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      height: 100%;
+      align-content: start;
+    }
+
+    .thumb {
+      position: relative;
+      border-radius: 14px;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: var(--panel);
+      overflow: hidden;
+      min-height: 180px;
+      cursor: default;
+      user-select: none;
+      transform: translateZ(0);
+    }
+
+    .thumb img {
+      width: 100%;
+      height: 160px;
+      object-fit: cover;
+      display: block;
+      filter: saturate(1.05) contrast(1.03);
+    }
+
+    .thumb .meta {
+      padding: 10px 12px 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .thumb .name {
+      font-weight: 650;
+      font-size: 14px;
+    }
+
+    .thumb .hint {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .thumb.hovered {
+      outline: 2px solid rgba(120,180,255,0.55);
+      box-shadow: 0 0 0 6px rgba(120,180,255,0.10);
+    }
+
+    .thumb.selected {
+      outline: 2px solid rgba(120,180,255,0.85);
+      box-shadow: 0 0 0 8px rgba(120,180,255,0.16);
+    }
+
+    /* Viewer */
+    #viewer {
+      position: absolute;
+      inset: 0;
+      background: rgba(10,14,28,0.92);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+
+    #viewer.visible { display: flex; }
+
+    #viewerImg {
+      max-width: 100%;
+      max-height: 100%;
+      border-radius: 14px;
+      border: 1px solid rgba(255,255,255,0.12);
+      box-shadow: 0 18px 50px rgba(0,0,0,0.45);
+      object-fit: contain;
+      background: rgba(255,255,255,0.04);
+    }
+
+    #closeBtn {
+      position: absolute;
+      top: 14px;
+      right: 14px;
+      border: 1px solid rgba(255,255,255,0.20);
+      background: rgba(255,255,255,0.08);
+      color: var(--text);
+      border-radius: 12px;
+      padding: 10px 12px;
+      font-weight: 800;
+      letter-spacing: 0.3px;
+      cursor: default;
+      user-select: none;
+    }
+    #closeBtn.hovered {
+      outline: 2px solid rgba(255,120,120,0.70);
+      box-shadow: 0 0 0 8px rgba(255,120,120,0.14);
+    }
+
+    /* Gesture cursor */
+    #cursor {
+      position: absolute;
+      width: 18px;
+      height: 18px;
+      border-radius: 999px;
+      background: rgba(120,180,255,0.40);
+      border: 2px solid rgba(120,180,255,0.95);
+      transform: translate(-50%, -50%);
+      pointer-events: none;
+      z-index: 4;
+      display: none;
+    }
+    #cursor.visible { display: block; }
+
+    /* Overlay canvas for points */
+    #overlay {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+      z-index: 5;
+    }
+
+    /* Logs */
+    #logs {
+      width: min(1100px, 100%);
+      margin: 0 auto;
+      display: block;
+      background: rgba(0,0,0,0.25);
+      border: 1px solid rgba(255,255,255,0.10);
+      border-radius: 12px;
+      color: rgba(255,255,255,0.85);
+      padding: 10px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 12px;
+      line-height: 1.35;
+      min-height: 140px;
+      resize: vertical;
+    }
+
+    .small {
+      font-size: 12px;
+      color: var(--muted);
+      margin-left: auto;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <button id="startBtn">Start Camera</button>
+    <div id="status">Loading…</div>
+    <div class="small">Pinch on a thumbnail to open. Pinch on (X) to close.</div>
+  </header>
+
+  <div id="wrap">
+    <div id="stage">
+      <video id="webcam" autoplay playsinline muted></video>
+
+      <div id="desktop">
+        <div id="cursor"></div>
+
+        <div class="grid" id="grid">
+          <!-- Thumbs injected by JS -->
+        </div>
+
+        <div id="viewer" aria-hidden="true">
+          <button id="closeBtn" type="button">(X)</button>
+          <img id="viewerImg" alt="Opened file" />
+        </div>
+      </div>
+
+      <canvas id="overlay"></canvas>
+    </div>
+
+    <textarea id="logs" readonly></textarea>
+  </div>
+
+  <script type="module">
+    import {
+      HandLandmarker,
+      FilesetResolver
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0";
+
+    // ==========
+    // DOM
+    // ==========
+    const startBtn = document.getElementById("startBtn");
+    const statusEl = document.getElementById("status");
+    const video = document.getElementById("webcam");
+    const stage = document.getElementById("stage");
+    const desktop = document.getElementById("desktop");
+    const overlay = document.getElementById("overlay");
+    const logs = document.getElementById("logs");
+
+    const gridEl = document.getElementById("grid");
+    const cursorEl = document.getElementById("cursor");
+
+    const viewerEl = document.getElementById("viewer");
+    const viewerImg = document.getElementById("viewerImg");
+    const closeBtn = document.getElementById("closeBtn");
+
+    const overlayCtx = overlay.getContext("2d");
+
+    // ==========
+    // Demo "files" (online URLs)
+    // ==========
+    const FILES = [
+      {
+        id: "1",
+        name: "Mountains",
+        url: "https://images.unsplash.com/photo-1501785888041-af3ef285b470?auto=format&fit=crop&w=1600&q=80"
+      },
+      {
+        id: "2",
+        name: "City",
+        url: "https://images.unsplash.com/photo-1469474968028-56623f02e42e?auto=format&fit=crop&w=1600&q=80"
+      },
+      {
+        id: "3",
+        name: "Forest",
+        url: "https://images.unsplash.com/photo-1441974231531-c6227db76b6e?auto=format&fit=crop&w=1600&q=80"
+      }
+    ];
+
+    function mountGrid() {
+      gridEl.innerHTML = "";
+      for (const f of FILES) {
+        const card = document.createElement("div");
+        card.className = "thumb file";
+        card.dataset.id = f.id;
+        card.dataset.src = f.url;
+        card.innerHTML = `
+          <img src="${f.url}" alt="${f.name}" />
+          <div class="meta">
+            <div class="name">${f.name}</div>
+            <div class="hint">pinch to open</div>
+          </div>
+        `;
+        gridEl.appendChild(card);
+      }
+    }
+    mountGrid();
+
+    const files = () => Array.from(document.querySelectorAll(".thumb.file"));
+
+    // ==========
+    // Logging / status
+    // ==========
+    function log(msg) {
+      const ts = new Date().toISOString().split("T")[1].split(".")[0];
+      logs.value = `[${ts}] ${msg}\n` + logs.value;
+    }
+    function setStatus(msg) {
+      statusEl.textContent = msg;
+      log(msg);
+    }
+
+    // ==========
+    // One Euro filter
+    // ==========
+    class OneEuroFilter {
+      constructor(freq = 60, minCutoff = 1.2, beta = 0.05, dCutoff = 1.0) {
+        this.freq = freq;
+        this.minCutoff = minCutoff;
+        this.beta = beta;
+        this.dCutoff = dCutoff;
+        this.xPrev = null;
+        this.dxPrev = 0;
+        this.tPrev = null;
+      }
+
+      alpha(cutoff) {
+        const te = 1.0 / this.freq;
+        const tau = 1.0 / (2 * Math.PI * cutoff);
+        return 1.0 / (1.0 + tau / te);
+      }
+
+      lowpass(prev, curr, a) {
+        return prev + a * (curr - prev);
+      }
+
+      filter(x, tMs) {
+        if (this.tPrev == null) {
+          this.tPrev = tMs;
+          this.xPrev = x;
+          this.dxPrev = 0;
+          return x;
+        }
+
+        const dt = Math.max(1e-6, (tMs - this.tPrev) / 1000);
+        this.freq = 1.0 / dt;
+
+        const dx = (x - this.xPrev) / dt;
+        const ad = this.alpha(this.dCutoff);
+        const dxHat = this.lowpass(this.dxPrev, dx, ad);
+
+        const cutoff = this.minCutoff + this.beta * Math.abs(dxHat);
+        const a = this.alpha(cutoff);
+
+        const xHat = this.lowpass(this.xPrev, x, a);
+
+        this.tPrev = tMs;
+        this.xPrev = xHat;
+        this.dxPrev = dxHat;
+
+        return xHat;
+      }
+
+      reset() {
+        this.xPrev = null;
+        this.dxPrev = 0;
+        this.tPrev = null;
+      }
+    }
+
+    const xFilter = new OneEuroFilter(60, 1.2, 0.05, 1.0);
+    const yFilter = new OneEuroFilter(60, 1.2, 0.05, 1.0);
+
+    // ==========
+    // Pinch debounce + hysteresis
+    // ==========
+    let pinchClosed = false;
+    let pinchOnCount = 0;
+    let pinchOffCount = 0;
+
+    const PINCH_ON = 0.30;
+    const PINCH_OFF = 0.60;
+    const ON_FRAMES = 2;
+    const OFF_FRAMES = 3;
+
+    // ==========
+    // State
+    // ==========
+    let handLandmarker = null;
+    let running = false;
+    let lastVideoTime = -1;
+
+    let wasPinching = false;
+    let isPinching = false;
+
+    let hoveredEl = null;
+    let selectedEl = null;
+
+    let mode = "grid"; // "grid" | "viewer"
+
+    // ==========
+    // Geometry
+    // ==========
+    function resizeOverlay() {
+      const rect = stage.getBoundingClientRect();
+      overlay.width = Math.round(rect.width);
+      overlay.height = Math.round(rect.height);
+    }
+
+    function distance(a, b) {
+      const dx = a.x - b.x;
+      const dy = a.y - b.y;
+      return Math.hypot(dx, dy);
+    }
+
+    // rough hand size: wrist ↔ index MCP
+    function getHandScale(landmarks) {
+      const wrist = landmarks[0];
+      const indexMcp = landmarks[5];
+      const d = distance(wrist, indexMcp);
+      return d > 0 ? d : 0.0001;
+    }
+
+    // Mirror X so left/right feels natural
+    function screenCoordsFromLandmark(landmark) {
+      const rect = stage.getBoundingClientRect();
+      const mirroredX = 1 - landmark.x;
+      const x = mirroredX * rect.width;
+      const y = landmark.y * rect.height;
+      return { x, y };
+    }
+
+    function elementUnderPoint(clientX, clientY) {
+      // top-most "clickable" under point, limited to thumbs / closeBtn
+      const el = document.elementFromPoint(clientX, clientY);
+      if (!el) return null;
+
+      // close button in viewer
+      if (el === closeBtn || closeBtn.contains(el)) return closeBtn;
+
+      // thumbnail card
+      const thumb = el.closest?.(".thumb.file");
+      if (thumb) return thumb;
+
+      return null;
+    }
+
+    function setHovered(next) {
+      if (hoveredEl === next) return;
+
+      // clear old hover styles
+      if (hoveredEl) {
+        if (hoveredEl.classList?.contains("thumb")) hoveredEl.classList.remove("hovered");
+        if (hoveredEl === closeBtn) closeBtn.classList.remove("hovered");
+      }
+
+      hoveredEl = next;
+
+      // apply new hover styles
+      if (hoveredEl) {
+        if (hoveredEl.classList?.contains("thumb")) hoveredEl.classList.add("hovered");
+        if (hoveredEl === closeBtn) closeBtn.classList.add("hovered");
+      }
+    }
+
+    function clearSelected() {
+      if (selectedEl && selectedEl.classList?.contains("thumb")) {
+        selectedEl.classList.remove("selected");
+      }
+      selectedEl = null;
+    }
+
+    function openFile(fileEl) {
+      const src = fileEl.dataset.src;
+      viewerImg.src = src;
+      viewerEl.classList.add("visible");
+      viewerEl.setAttribute("aria-hidden", "false");
+      mode = "viewer";
+
+      log(`OPEN file ${fileEl.dataset.id}`);
+    }
+
+    function closeViewer() {
+      viewerEl.classList.remove("visible");
+      viewerEl.setAttribute("aria-hidden", "true");
+      mode = "grid";
+
+      log("CLOSE viewer");
+    }
+
+    function updatePinchStateDebounced(landmarks) {
+      const thumbTip = landmarks[4];
+      const indexTip = landmarks[8];
+
+      const rawDist = distance(thumbTip, indexTip);
+      const handScale = getHandScale(landmarks);
+      const normDist = rawDist / handScale;
+
+      if (!pinchClosed) {
+        if (normDist < PINCH_ON) pinchOnCount++;
+        else pinchOnCount = 0;
+
+        if (pinchOnCount >= ON_FRAMES) {
+          pinchClosed = true;
+          pinchOnCount = 0;
+          pinchOffCount = 0;
+          log(`Pinch ON (normDist=${normDist.toFixed(2)})`);
+        }
+      } else {
+        if (normDist > PINCH_OFF) pinchOffCount++;
+        else pinchOffCount = 0;
+
+        if (pinchOffCount >= OFF_FRAMES) {
+          pinchClosed = false;
+          pinchOffCount = 0;
+          pinchOnCount = 0;
+          log(`Pinch OFF (normDist=${normDist.toFixed(2)})`);
+        }
+      }
+
+      return pinchClosed;
+    }
+
+    // ==========
+    // Draw only index+thumb points (no skeleton)
+    // ==========
+    function clearOverlay() {
+      overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+    }
+
+    function drawPoint(x, y, radius, fillStyle, strokeStyle) {
+      overlayCtx.beginPath();
+      overlayCtx.arc(x, y, radius, 0, Math.PI * 2);
+      overlayCtx.fillStyle = fillStyle;
+      overlayCtx.fill();
+      overlayCtx.lineWidth = 2;
+      overlayCtx.strokeStyle = strokeStyle;
+      overlayCtx.stroke();
+    }
+
+    function drawThumbIndexPoints(landmarks) {
+      clearOverlay();
+
+      const thumb = screenCoordsFromLandmark(landmarks[4]);
+      const index = screenCoordsFromLandmark(landmarks[8]);
+
+      // thumb: slightly smaller
+      drawPoint(thumb.x, thumb.y, 7, "rgba(255,255,255,0.30)", "rgba(255,255,255,0.85)");
+      // index: slightly larger + accent
+      drawPoint(index.x, index.y, 9, "rgba(120,180,255,0.35)", "rgba(120,180,255,0.95)");
+    }
+
+    // ==========
+    // MediaPipe init/start
+    // ==========
+    async function initHandLandmarker() {
+      setStatus("Loading MediaPipe hand model…");
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.0/wasm"
+      );
+
+      handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath:
+            "https://storage.googleapis.com/mediapipe-assets/hand_landmarker.task"
+        },
+        numHands: 1,
+        runningMode: "VIDEO"
+      });
+
+      setStatus("Model loaded. Click Start Camera.");
+    }
+
+    async function startCamera() {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 1280, height: 720 }
+      });
+      video.srcObject = stream;
+
+      await new Promise((resolve) => {
+        video.onloadedmetadata = () => {
+          video.play();
+          resolve();
+        };
+      });
+
+      resizeOverlay();
+      window.addEventListener("resize", resizeOverlay);
+
+      running = true;
+      cursorEl.classList.add("visible");
+      setStatus("Camera started. Use index as cursor; pinch to select.");
+      log("Ready.");
+
+      requestAnimationFrame(loop);
+    }
+
+    // ==========
+    // Main loop
+    // ==========
+    function loop() {
+      if (!running || !handLandmarker) return;
+
+      const videoTime = video.currentTime;
+      if (videoTime === lastVideoTime) {
+        requestAnimationFrame(loop);
+        return;
+      }
+      lastVideoTime = videoTime;
+
+      const nowMs = performance.now();
+      const results = handLandmarker.detectForVideo(video, nowMs);
+
+      if (results?.landmarks?.length) {
+        const landmarks = results.landmarks[0];
+
+        // pinch
+        isPinching = updatePinchStateDebounced(landmarks);
+
+        // cursor: index tip
+        const idxTip = landmarks[8];
+        let { x, y } = screenCoordsFromLandmark(idxTip);
+
+        // smooth
+        x = xFilter.filter(x, nowMs);
+        y = yFilter.filter(y, nowMs);
+
+        // move cursor element (relative to stage)
+        cursorEl.style.left = `${x}px`;
+        cursorEl.style.top = `${y}px`;
+
+        // draw only thumb/index points
+        drawThumbIndexPoints(landmarks);
+
+        // Hover detection uses client coords
+        const stageRect = stage.getBoundingClientRect();
+        const clientX = stageRect.left + x;
+        const clientY = stageRect.top + y;
+
+        const under = elementUnderPoint(clientX, clientY);
+
+        // Only allow thumb interactions based on mode:
+        if (mode === "grid") {
+          // in grid mode, hover thumbs only
+          setHovered(under && under.classList?.contains("thumb") ? under : null);
+          closeBtn.classList.remove("hovered");
+        } else {
+          // in viewer mode, hover close only
+          setHovered(under === closeBtn ? closeBtn : null);
+        }
+
+        // Pinch edge triggers selection
+        if (isPinching && !wasPinching) {
+          // pinch down
+          if (mode === "grid") {
+            const target = hoveredEl && hoveredEl.classList?.contains("thumb") ? hoveredEl : null;
+            if (target) {
+              clearSelected();
+              selectedEl = target;
+              selectedEl.classList.add("selected");
+              openFile(selectedEl);
+            } else {
+              log("Pinch down: nothing selected");
+            }
+          } else {
+            // viewer mode: pinch close
+            if (hoveredEl === closeBtn) {
+              closeViewer();
+              clearSelected();
+              setHovered(null);
+            } else {
+              log("Pinch down in viewer: not on (X)");
+            }
+          }
+        }
+
+        wasPinching = isPinching;
+      } else {
+        // hand lost
+        clearOverlay();
+        setHovered(null);
+
+        wasPinching = false;
+        isPinching = false;
+
+        pinchClosed = false;
+        pinchOnCount = 0;
+        pinchOffCount = 0;
+
+        xFilter.reset();
+        yFilter.reset();
+      }
+
+      requestAnimationFrame(loop);
+    }
+
+    // ==========
+    // Wire up
+    // ==========
+    startBtn.addEventListener("click", async () => {
+      if (!handLandmarker) {
+        setStatus("Still loading model…");
+        return;
+      }
+      if (!running) {
+        try {
+          await startCamera();
+        } catch (err) {
+          setStatus("Error starting camera: " + (err?.message || err));
+        }
+      }
+    });
+
+    // Optional: allow mouse click close for debugging
+    closeBtn.addEventListener("click", () => closeViewer());
+
+    if (!("mediaDevices" in navigator && "getUserMedia" in navigator.mediaDevices)) {
+      setStatus("getUserMedia not supported in this browser.");
+    } else {
+      initHandLandmarker().catch((err) => {
+        setStatus("Failed to init MediaPipe: " + (err?.message || err));
+      });
+    }
+  </script>
+</body>
+</html>
