@@ -579,17 +579,42 @@
       overlayCtx.stroke();
     }
 
-    function drawThumbIndexPoints(landmarks) {
-      clearOverlay();
+    function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
 
-      const thumb = screenCoordsFromLandmark(landmarks[4]);
-      const index = screenCoordsFromLandmark(landmarks[8]);
+// Scale dot size based on hand distance:
+// - Use wrist↔index MCP distance as a "hand size" proxy.
+// - Convert to pixels using stage dimensions.
+// - Map to a radius range.
+function drawThumbIndexPoints(landmarks) {
+  clearOverlay();
 
-      // thumb: slightly smaller
-      drawPoint(thumb.x, thumb.y, 7, "rgba(255,255,255,0.30)", "rgba(255,255,255,0.85)");
-      // index: slightly larger + accent
-      drawPoint(index.x, index.y, 9, "rgba(120,180,255,0.35)", "rgba(120,180,255,0.95)");
-    }
+  const thumb = screenCoordsFromLandmark(landmarks[4]);
+  const index = screenCoordsFromLandmark(landmarks[8]);
+
+  // Hand "size" in normalized units (0..~0.5 depending on framing)
+  const hsNorm = getHandScale(landmarks);
+
+  // Convert to pixels (use smaller stage dimension to stay consistent)
+  const stageRect = stage.getBoundingClientRect();
+  const minDim = Math.min(stageRect.width, stageRect.height);
+  const hsPx = hsNorm * minDim;
+
+  // Calibrate these to your setup:
+  // Far hand might be ~40–80px, close hand might be ~140–220px.
+  const FAR_PX = 60;     // smaller hand => farther
+  const NEAR_PX = 180;   // bigger hand => closer
+
+  // 0 when far, 1 when near
+  const t = clamp((hsPx - FAR_PX) / (NEAR_PX - FAR_PX), 0, 1);
+
+  // Radius range
+  const thumbR = lerp(5, 12, t);
+  const indexR = lerp(7, 16, t);
+
+  drawPoint(thumb.x, thumb.y, thumbR, "rgba(255,255,255,0.30)", "rgba(255,255,255,0.85)");
+  drawPoint(index.x, index.y, indexR, "rgba(120,180,255,0.35)", "rgba(120,180,255,0.95)");
+}
 
     // ==========
     // MediaPipe init/start
